@@ -1,0 +1,188 @@
+"""
+지원 DB : Oracle, PostgreSQL, MSSQL, MariaDB/MySQL
+필요 패키지:
+    pip install oracledb psycopg2-binary pyodbc pymysql
+"""
+
+from abc import ABC, abstractmethod
+from contextlib import contextmanager
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+# ══════════════════════════════════════════════════════════════
+# 추상 베이스 커넥터
+# ══════════════════════════════════════════════════════════════
+class BaseConnector(ABC):
+    """모든 DB 커넥터의 공통 인터페이스."""
+
+    def __init__(self, conn_id: str):
+        self.conn_id = conn_id
+
+    @abstractmethod
+    def _acquire(self): ...         # 풀에서 커넥션 꺼내기
+
+    @abstractmethod
+    def _release(self, conn): ...   # 풀에 커넥션 반납
+
+    @abstractmethod
+    def close_pool(self): ...       # 풀 전체 종료
+
+    @abstractmethod
+    def test(self) -> bool: ...     # 연결 상태 확인
+
+    # ── 공통 메서드 (모든 DB에서 동일하게 사용) ─────────────
+    @contextmanager
+    def transaction(self):
+        """트랜잭션 — 정상 종료 시 commit, 예외 시 rollback."""
+        conn = self._acquire()
+        try:
+            yield conn
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            raise
+        finally:
+            self._release(conn)
+
+    def execute_query(self, query: str, params: Optional[Tuple] = None) -> List:
+        """SELECT 쿼리 실행 후 전체 결과 반환."""
+        conn = self._acquire()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(query, params or ())
+            return cursor.fetchall()
+        finally:
+            cursor.close()
+            self._release(conn)
+
+    def execute_dml(self, query: str, params: Optional[Tuple] = None) -> int:
+        """INSERT / UPDATE / DELETE 실행 후 영향받은 행 수 반환."""
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params or ())
+            return cursor.rowcount
+
+    def execute_many(self, query: str, data: List[Tuple]) -> int:
+        """다건 DML을 일괄 처리."""
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.executemany(query, data)
+            return cursor.rowcount
+
+# ══════════════════════════════════════════════════════════════
+# DB별 커넥터 구현
+# ══════════════════════════════════════════════════════════════
+class Oracle_DB(BaseConnector):
+    def __init__(self, conn_id, host, port=1521, service_name="", sid="", user="", password="", min_pool=2, max_pool=10):
+        super().__init__(conn_id)
+        
+        try:
+            import oracledb
+        except ImportError:
+            raise ImportError("pip install oracledb")
+
+        dsn = oracledb.makedsn(host, port,
+                               service_name=service_name if service_name else None,
+                               sid=sid if sid else None)
+        self._pool = oracledb.create_pool(
+            user=user, password=password, dsn=dsn, min=min_pool, max=max_pool, increment=1
+        )
+        logger.info("[%s] Oracle 풀 생성 → %s:%s", conn_id, host, port)
+
+    def _acquire(self):       return self._pool.acquire()
+    def _release(self, conn): self._pool.release(conn)
+    def close_pool(self):     self._pool.close(); logger.info("[%s] Oracle 풀 종료", self.conn_id)
+    def test(self) -> bool:
+        try:
+            self.execute_query("SELECT 1 FROM DUAL")
+            return True
+        except Exception:
+            return False
+
+
+
+class PostgresConnector(BaseConnector):
+    def __init__(self, conn_id, host="localhost", port=5432,
+                 database="", user="", password="", min_pool=2, max_pool=10):
+        super().__init__(conn_id)
+        try:
+            from psycopg2 import pool as pg_pool
+            self._pool = pg_pool.ThreadedConnectionPool(
+                minconn=min_pool, maxconn=max_pool,
+                host=host, port=port, dbname=database, user=user, password=password
+            )
+        except ImportError:
+            raise ImportError("pip install psycopg2-binary")
+        logger.info("[%s] PostgreSQL 풀 생성 → %s:%s/%s", conn_id, host, port, database)
+
+    def _acquire(self):       return self._pool.getconn()
+    def _release(self, conn): self._pool.putconn(conn)
+    def close_pool(self):     self._pool.closeall(); logger.info("[%s] PostgreSQL 풀 종료", self.conn_id)
+    def test(self) -> bool:
+        try:
+            self.execute_query("SELECT 1")
+            return True
+        except Exception:
+            return False
+
+
+class MSSQLConnector(BaseConnector):
+    def __init__(self, conn_id, host="localhost", port=1433, database="",
+                 user="", password="", driver="ODBC Driver 17 for SQL Server", pool_size=5):
+        super().__init__(conn_id)
+        try:
+            import pyodbc
+        except ImportError:
+            raise ImportError("pip install pyodbc")
+
+        conn_str = (f"DRIVER={{{driver}}};SERVER={host},{port};"
+                    f"DATABASE={database};UID={user};PWD={password};")
+        self._pool: queue.Queue = queue.Queue(maxsize=pool_size)
+        for _ in range(pool_size):
+            self._pool.put(pyodbc.connect(conn_str, autocommit=False))
+        logger.info("[%s] MSSQL 풀 생성(%d) → %s:%s/%s", conn_id, pool_size, host, port, database)
+
+    def _acquire(self):       return self._pool.get(timeout=10)
+    def _release(self, conn): self._pool.put(conn)
+    def close_pool(self):
+        while not self._pool.empty(): self._pool.get_nowait().close()
+        logger.info("[%s] MSSQL 풀 종료", self.conn_id)
+    def test(self) -> bool:
+        try:
+            self.execute_query("SELECT 1")
+            return True
+        except Exception:
+            return False
+
+
+class MariaDBConnector(BaseConnector):
+    def __init__(self, conn_id, host="localhost", port=3306, database="",
+                 user="", password="", charset="utf8mb4", pool_size=5):
+        super().__init__(conn_id)
+        try:
+            import pymysql
+            self._pymysql = pymysql
+        except ImportError:
+            raise ImportError("pip install pymysql")
+
+        self._config = dict(host=host, port=port, db=database,
+                            user=user, password=password, charset=charset,
+                            cursorclass=pymysql.cursors.DictCursor, autocommit=False)
+        self._pool: queue.Queue = queue.Queue(maxsize=pool_size)
+        for _ in range(pool_size):
+            self._pool.put(pymysql.connect(**self._config))
+        logger.info("[%s] MariaDB 풀 생성(%d) → %s:%s/%s", conn_id, pool_size, host, port, database)
+
+    def _acquire(self):
+        conn = self._pool.get(timeout=10)
+        conn.ping(reconnect=True)   # 끊겼으면 자동 재연결
+        return conn
+    def _release(self, conn): self._pool.put(conn)
+    def close_pool(self):
+        while not self._pool.empty(): self._pool.get_nowait().close()
+        logger.info("[%s] MariaDB 풀 종료", self.conn_id)
+    def test(self) -> bool:
+        try:
+            self.execute_query("SELECT 1")
+            return True
+        except Exception:
+            return False
