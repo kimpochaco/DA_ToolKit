@@ -4,9 +4,18 @@
     pip install oracledb psycopg2-binary pyodbc pymysql
 """
 
+from __future__ import annotations
+
+import logging
+import queue
+import threading
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("connet_any_DB")
+
 
 # ══════════════════════════════════════════════════════════════
 # 추상 베이스 커넥터
@@ -39,6 +48,7 @@ class BaseConnector(ABC):
             conn.commit()
         except Exception as e:
             conn.rollback()
+            logger.error("[%s] 롤백: %s", self.conn_id, e)
             raise
         finally:
             self._release(conn)
@@ -55,26 +65,34 @@ class BaseConnector(ABC):
             self._release(conn)
 
     def execute_dml(self, query: str, params: Optional[Tuple] = None) -> int:
-        """INSERT / UPDATE / DELETE 실행 후 영향받은 행 수 반환."""
+        """
+        INSERT / UPDATE / DELETE 실행 후 영향받은 행 수 반환.
+        ALL or Nothing
+        """
+
         with self.transaction() as conn:
             cursor = conn.cursor()
             cursor.execute(query, params or ())
             return cursor.rowcount
 
     def execute_many(self, query: str, data: List[Tuple]) -> int:
-        """다건 DML을 일괄 처리."""
+        """
+        다건 DML을 일괄 처리.
+        ALL or Nothing
+        """
         with self.transaction() as conn:
             cursor = conn.cursor()
             cursor.executemany(query, data)
             return cursor.rowcount
 
+
 # ══════════════════════════════════════════════════════════════
 # DB별 커넥터 구현
 # ══════════════════════════════════════════════════════════════
-class Oracle_DB(BaseConnector):
-    def __init__(self, conn_id, host, port=1521, service_name="", sid="", user="", password="", min_pool=2, max_pool=10):
+class OracleConnector(BaseConnector):
+    def __init__(self, conn_id, host, port=1521, service_name="", sid="",
+                 user="", password="", min_pool=2, max_pool=10):
         super().__init__(conn_id)
-        
         try:
             import oracledb
         except ImportError:
@@ -97,7 +115,6 @@ class Oracle_DB(BaseConnector):
             return True
         except Exception:
             return False
-
 
 
 class PostgresConnector(BaseConnector):
@@ -186,3 +203,135 @@ class MariaDBConnector(BaseConnector):
             return True
         except Exception:
             return False
+
+
+# ══════════════════════════════════════════════════════════════
+# DBConFactory
+# ══════════════════════════════════════════════════════════════
+class DBConFactory:
+    """
+    DB 커넥터를 생성·관리하는 DBConFactory.
+
+    같은 DB 타입이라도 conn_id 가 다르면 독립된 풀로 관리됩니다.
+
+    [사용 예시]
+        DBConFactory = connet_any_DB()
+        DBConFactory.register_oracle("oracle_prod", host="prod.db.com", ...)
+        DBConFactory.register_oracle("oracle_dev",  host="dev.db.com",  ...)
+
+        prod = DBConFactory.get("oracle_prod")
+        rows = prod.execute_query("SELECT * FROM orders")
+
+        DBConFactory.close_all()
+    """
+
+    def __init__(self):
+        self._registry: Dict[str, BaseConnector] = {}
+
+    # ── 등록 ────────────────────────────────────────────────
+    def register_oracle(self, conn_id: str, **kwargs) -> OracleConnector:
+        return self._add(conn_id, OracleConnector, **kwargs)
+
+    def register_postgres(self, conn_id: str, **kwargs) -> PostgresConnector:
+        return self._add(conn_id, PostgresConnector, **kwargs)
+
+    def register_mssql(self, conn_id: str, **kwargs) -> MSSQLConnector:
+        return self._add(conn_id, MSSQLConnector, **kwargs)
+
+    def register_mariadb(self, conn_id: str, **kwargs) -> MariaDBConnector:
+        return self._add(conn_id, MariaDBConnector, **kwargs)
+
+    def _add(self, conn_id: str, cls, **kwargs) -> BaseConnector:
+        if conn_id in self._registry:
+            logger.warning("[%s] 이미 등록된 conn_id — 기존 반환", conn_id)
+            return self._registry[conn_id]
+        connector = cls(conn_id=conn_id, **kwargs)
+        self._registry[conn_id] = connector
+        return connector
+
+    # ── 조회 / 관리 ─────────────────────────────────────────
+    def get(self, conn_id: str) -> BaseConnector:
+        if conn_id not in self._registry:
+            raise KeyError(f"등록되지 않은 conn_id: '{conn_id}' | 등록 목록: {self.list()}")
+        return self._registry[conn_id]
+
+    def list(self) -> List[str]:
+        return list(self._registry.keys())
+
+    def health_check(self) -> Dict[str, bool]:
+        result = {cid: c.test() for cid, c in self._registry.items()}
+        for cid, ok in result.items():
+            logger.info("헬스체크 [%s]: %s", cid, "✅ 정상" if ok else "❌ 비정상")
+        return result
+
+    def close(self, conn_id: str):
+        connector = self._registry.pop(conn_id, None)
+        if connector:
+            connector.close_pool()
+
+    def close_all(self):
+        for connector in self._registry.values():
+            connector.close_pool()
+        self._registry.clear()
+        logger.info("모든 커넥터 종료")
+
+
+################################################################
+# ══════════════════════════════════════════════════════════════
+# DBConFactory 사용예시 (추천)
+# ══════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+
+    DBConFactory = DBConFactory()
+
+    # Oracle 2개 — 타입 같아도 conn_id 가 달라 완전 독립
+    # DBConFactory.register_oracle("oracle_prod",
+    #     host="prod.db.com", port = "1521"
+    #     user="app_user", password="prod_pw"
+    #     sid = "PROD", "service_name="PROD"
+    #     ) min/max pool 옵션
+    #
+    # DBConFactory.register_oracle("oracle_dev",
+    #     host="dev.db.com", service_name="DEV",
+    #     user="dev_user", password="dev_pw", max_pool=5)
+
+    # PostgreSQL
+    # DBConFactory.register_postgres("AR_DB",
+    #     host="localhost", database="mydb", user="user", password="pw")
+
+    # MSSQL
+    # DBConFactory.register_mssql("mssql_erp",
+    #     host="erp.db.com", database="ERP", user="sa", password="pw")
+
+    # MariaDB
+    # DBConFactory.register_mariadb("maria_log",
+    #     host="localhost", database="logs", user="root", password="pw")
+
+    # ── 공통 인터페이스로 사용 (DB 종류 몰라도 됨) ──────────
+    # oracle_prod = DBConFactory.get("oracle_prod")
+    # oracle_dev  = DBConFactory.get("oracle_dev")
+    # AR_DB  = DBConFactory.get("AR_DB")
+    # rows = oracle_prod.execute_query("SELECT * FROM orders WHERE ROWNUM <= 10")
+    #
+    # with oracle_dev.transaction() as conn:
+    #     conn.cursor().execute("DELETE FROM temp_logs")
+    #
+    # print(DBConFactory.health_check())
+    # DBConFactory.close_all()
+
+    print("등록된 커넥터:", DBConFactory.list())
+
+# ══════════════════════════════════════════════════════════════
+# 커넥터직접 사용예시
+# ══════════════════════════════════════════════════════════════
+    # 동일한 oracle db인 경우 변수를 추가 생성하여 관리 필요 
+    # oracle_DB = OracleConnector(
+    #     conn_id = "IS"
+    #       , host = "172.16.105.117"
+    #       , port = "1521"
+    #       , user = "E2218030"
+    #       , password = "password"
+    #       , service_name = "PDB1"
+    #       , sid = "PDB1")
+    #
+    #  oracle_DB.execute_query(query = "select 1 from dual")
